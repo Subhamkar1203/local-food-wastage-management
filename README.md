@@ -69,24 +69,14 @@ git clone https://github.com/Subhamkar1203/local-food-wastage-management.git
 cd local-food-wastage-management
 ````
 
-### Step 2: Create a Virtual Environment (Recommended)
 
-```bash
-python -m venv venv
-# Activate the virtual environment
-# On Windows:
-.\venv\Scripts\activate
-# On macOS/Linux:
-source venv/bin/activate
-```
-
-### Step 3: Install Dependencies
+### Step 2: Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### Step 4: Run the Application
+### Step 3: Run the Application
 
 ```bash
 streamlit run app.py
