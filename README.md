@@ -113,8 +113,3 @@ Contributions are welcome! Please follow these steps:
 5. Open a Pull Request.
 
 ---
-
-
-
-If you want, I can also **make it more visually appealing with badges for "Run Locally" and "Live Demo"** so it looks very professional on GitHub. Do you want me to do that?
-```
