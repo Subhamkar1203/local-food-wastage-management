@@ -1,435 +1,331 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-import plotly.express as px
 
-# Set page configuration for a better look
-st.set_page_config(
-    page_title="Local Food Wastage Management System",
-    page_icon="",
-    layout="wide",
-)
-
-@st.cache_resource
-def get_connection():
-    try:
-        return sqlite3.connect("food_waste.db", check_same_thread=False)
-    except sqlite3.Error as e:
-        st.error(f"Database connection error: {e}")
-        return None
-
-conn = get_connection()
+def get_conn():
+    return sqlite3.connect("food_waste.db")
 
 def run_query(query, params=None):
-    if conn:
-        try:
-            if params:
-                return pd.read_sql(query, conn, params=params)
-            else:
-                return pd.read_sql(query, conn)
-        except pd.io.sql.DatabaseError as e:
-            st.error(f"Query execution error: {e}")
-            return pd.DataFrame()
-    return pd.DataFrame()
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(query, params or ())
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return pd.DataFrame([dict(row) for row in rows])
 
-menu = ["Dashboard", "Analytics Dashboard", "Claims", "Food Listings", "CRUD Operations"]
-choice = st.sidebar.selectbox("Menu", menu)
+def run_commit(query, params=None):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(query, params or ())
+    conn.commit()
+    lastrow = cur.lastrowid
+    cur.close()
+    conn.close()
+    return lastrow
 
-st.title("Local Food Wastage Management System")
-st.markdown("---")
+def get_distinct_values(table, column):
+    df = run_query(f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL")
+    if df.empty:
+        return []
+    return sorted(df[df.columns[0]].dropna().astype(str).tolist())
 
-if choice == "Dashboard":
-    st.subheader("System Overview")
-    
+def browse_listings():
+    st.header("Browse Listings")
+
+    cities = ["All"] + get_distinct_values("Food_Listings", "Location")
+    providers = ["All"] + get_distinct_values("Providers", "Name")
+    food_types = get_distinct_values("Food_Listings", "Food_Type")
+    meal_types = ["All"] + get_distinct_values("Food_Listings", "Meal_Type")
+
     col1, col2, col3 = st.columns(3)
-    
     with col1:
-        total_providers = run_query("SELECT COUNT(*) as Total FROM Providers")["Total"][0]
-        st.metric(label="Total Providers", value=f" {total_providers}")
-    
+        city = st.selectbox("City", cities)
     with col2:
-        total_receivers = run_query("SELECT COUNT(*) as Total FROM Receivers")["Total"][0]
-        st.metric(label="Total Receivers", value=f" {total_receivers}")
-        
+        provider = st.selectbox("Provider", providers)
     with col3:
-        total_food = run_query("SELECT SUM(Quantity) as Total FROM Food_Listings")["Total"][0]
-        st.metric(label="Total Food Quantity Listed", value=f" {total_food}")
+        food_type = st.multiselect("Food Type", options=food_types)
 
-    st.markdown("---")
-    
-    st.write("### Food Quantity by City")
-    city_data = run_query("""
-        SELECT Location, SUM(Quantity) as Total_Quantity
-        FROM Food_Listings
-        GROUP BY Location
-    """)
-    if not city_data.empty:
-        fig = px.bar(
-            city_data, 
-            x='Location', 
-            y='Total_Quantity',
-            title='Total Food Quantity by City',
-            labels={'Total_Quantity': 'Quantity (Units)', 'Location': 'City'},
-            text='Total_Quantity'
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No food data available to display.")
+    meal = st.selectbox("Meal Type", meal_types)
 
-elif choice == "Analytics Dashboard":
-    st.subheader("In-depth Analytics")
-    
-    st.markdown("---")
-    
-    # --- 1. Providers and Receivers by City (Grouped Bar Chart) ---
-    st.write("#### 1. Providers and Receivers by City")
-    providers_receivers_by_city = run_query("""
-        SELECT City, COUNT(DISTINCT Provider_ID) AS Providers,
-               (SELECT COUNT(DISTINCT Receiver_ID) FROM Receivers WHERE City = p.City) AS Receivers
-        FROM Providers p
-        GROUP BY City;
-    """)
-    if not providers_receivers_by_city.empty:
-        fig = px.bar(
-            providers_receivers_by_city.melt(id_vars='City', value_vars=['Providers', 'Receivers']),
-            x='City', y='value', color='variable',
-            barmode='group',
-            labels={'value': 'Count', 'variable': 'Type'},
-            title='Providers vs Receivers by City'
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No data available for providers and receivers by city.")
-    
-    st.markdown("---")
+    base_q = """
+      SELECT f.Food_ID, f.Food_Name, f.Quantity, f.Expiry_Date, f.Meal_Type, f.Food_Type, f.Location,
+             p.Provider_ID, p.Name as Provider_Name, p.Contact as Provider_Contact, p.Address as Provider_Address
+      FROM Food_Listings f
+      JOIN Providers p ON f.Provider_ID = p.Provider_ID
+    """
+    where = []
+    params = []
+    if city and city != "All":
+        where.append("f.Location = ?"); params.append(city)
+    if provider and provider != "All":
+        where.append("p.Name = ?"); params.append(provider)
+    if food_type:
+        where.append("f.Food_Type IN (" + ",".join(["?"]*len(food_type)) + ")")
+        params.extend(food_type)
+    if meal and meal != "All":
+        where.append("f.Meal_Type = ?"); params.append(meal)
 
-    # --- 2. Top Provider Type (Donut Chart) ---
-    st.write("#### 2. Top Provider Type")
-    top_provider_type = run_query("SELECT Type, COUNT(*) AS Count FROM Providers GROUP BY Type ORDER BY Count DESC;")
-    if not top_provider_type.empty:
-        fig = px.pie(
-            top_provider_type, names='Type', values='Count',
-            title="Distribution of Provider Types", hole=0.3
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No data available for provider types.")
-    
-    st.markdown("---")
+    if where:
+        base_q += " WHERE " + " AND ".join(where)
+    base_q += " ORDER BY f.Expiry_Date ASC;"
 
-    # --- 3. Provider Contact by City (DataFrame) ---
-    st.write("#### 3. Provider Contact by City")
-    providers_in_db = run_query("SELECT DISTINCT City FROM Providers")
-    if not providers_in_db.empty:
-        selected_city = st.selectbox("Select a City to view Provider Contacts:", providers_in_db["City"])
-        provider_contact_by_city = run_query(f"SELECT Name, Contact FROM Providers WHERE City = '{selected_city}';")
-        if not provider_contact_by_city.empty:
-            st.dataframe(provider_contact_by_city, use_container_width=True)
-        else:
-            st.info("No providers found for the selected city.")
-    else:
-        st.info("No cities available to select.")
-    
-    st.markdown("---")
+    df = run_query(base_q, tuple(params))
+    st.write(f"**{len(df)} listings found**")
+    st.dataframe(df)
 
-    # --- 4. Top Receivers by Claims (Bar Chart) ---
-    st.write("#### 4. Top Receivers by Claims")
-    top_receivers_by_claims = run_query("""
-        SELECT r.Name, COUNT(c.Claim_ID) AS Total_Claims
-        FROM Claims c
-        JOIN Receivers r ON c.Receiver_ID = r.Receiver_ID
-        GROUP BY r.Name
-        ORDER BY Total_Claims DESC;
-    """)
-    if not top_receivers_by_claims.empty:
-        fig = px.bar(
-            top_receivers_by_claims, x='Name', y='Total_Claims',
-            title='Top Receivers by Total Claims', text='Total_Claims'
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No claims data available to show top receivers.")
-    
-    st.markdown("---")
-    
-    # --- 5. Total Food Quantity (Metric) ---
-    st.write("#### 5. Total Food Quantity")
-    total_food_quantity = run_query("SELECT SUM(Quantity) AS Total_Quantity FROM Food_Listings;")
-    if not total_food_quantity.empty:
-        st.metric("Total Quantity of Food Listed", f" {total_food_quantity.iloc[0]['Total_Quantity']}")
-    else:
-        st.info("No food listings available.")
-        
-    st.markdown("---")
+    if not df.empty:
+        sel = st.selectbox("Select a listing to see details / claim", df['Food_ID'].astype(str).tolist())
+        row = df[df['Food_ID'] == int(sel)].iloc[0]
+        st.subheader(row['Food_Name'])
+        st.markdown(f"- **Quantity:** {row['Quantity']}")
+        st.markdown(f"- **Expiry Date:** {row['Expiry_Date']}")
+        st.markdown(f"- **Provider:** {row['Provider_Name']} (ID: {row['Provider_ID']})")
+        with st.expander("Provider contact details"):
+            st.markdown(f"**Contact:** {row['Provider_Contact']}")
+            st.markdown(f"**Address:** {row['Provider_Address']}")
 
-    # --- 6. City with Most Food Listings (Metric) ---
-    st.write("#### 6. City with Most Food Listings")
-    city_with_most_food_listings = run_query("""
-        SELECT Location, COUNT(*) AS Listings
-        FROM Food_Listings
-        GROUP BY Location
-        ORDER BY Listings DESC
-        LIMIT 1;
-    """)
-    if not city_with_most_food_listings.empty:
-        st.metric("City with Most Listings", f" {city_with_most_food_listings.iloc[0]['Location']}")
-    else:
-        st.info("No data available.")
+        st.write("---")
+        with st.form("claim_form"):
+            receiver_id = st.text_input("Enter your Receiver ID")
+            submit = st.form_submit_button("Submit Claim")
+            if submit:
+                if not receiver_id:
+                    st.error("Please provide your Receiver ID.")
+                else:
+                    insert_q = "INSERT INTO Claims (Food_ID, Receiver_ID, Status, Timestamp) VALUES (?, ?, 'Pending', datetime('now'));"
+                    run_commit(insert_q, (int(sel), int(receiver_id)))
+                    st.success("Claim submitted. Provider will be notified.")
 
-    st.markdown("---")
+def admin_food_listings():
+    st.header("Food Listings — Add / Edit / Delete")
 
-    # --- 7. Most Common Food Types (Bar Chart) ---
-    st.write("#### 7. Most Common Food Types")
-    most_common_food_types = run_query("""
-        SELECT Food_Type, COUNT(*) AS Count
-        FROM Food_Listings
-        GROUP BY Food_Type
-        ORDER BY Count DESC;
-    """)
-    if not most_common_food_types.empty:
-        fig = px.bar(
-            most_common_food_types, x='Food_Type', y='Count', color='Food_Type',
-            title='Most Common Food Types', text='Count'
-        )
-        # Update layout to increase font size for x-axis labels
-        fig.update_layout(xaxis_title_font=dict(size=18), xaxis_tickfont=dict(size=14))
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No data available for food types.")
-    
-    st.markdown("---")
-    
-    # --- 8. Claims per Food Item (Bar Chart) ---
-    st.write("#### 8. Claims per Food Item")
-    claims_per_food_item = run_query("""
-        SELECT f.Food_Name, COUNT(c.Claim_ID) AS Claims
-        FROM Claims c
-        JOIN Food_Listings f ON c.Food_ID = f.Food_ID
-        GROUP BY f.Food_Name;
-    """)
-    if not claims_per_food_item.empty:
-        fig = px.bar(
-            claims_per_food_item, x='Food_Name', y='Claims', color='Claims',
-            title='Claims per Food Item', text='Claims'
-        )
-        # Update layout for larger font sizes
-        fig.update_layout(xaxis_title_font=dict(size=18), xaxis_tickfont=dict(size=14))
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No claims data available.")
-        
-    st.markdown("---")
+    # Add new
+    with st.expander("Add new listing"):
+        with st.form("add_food"):
+            name = st.text_input("Food Name")
+            qty = st.number_input("Quantity", min_value=1, value=1)
+            expiry = st.date_input("Expiry Date")
+            provider_id = st.selectbox("Provider", get_distinct_values("Providers", "Provider_ID"))
+            provider_type = st.text_input("Provider Type")
+            location = st.text_input("Location")
+            food_type = st.text_input("Food Type")
+            meal_type = st.text_input("Meal Type")
+            submit_add = st.form_submit_button("Add Listing")
+            if submit_add:
+                q = """INSERT INTO Food_Listings
+                       (Food_Name, Quantity, Expiry_Date, Provider_ID, Provider_Type, Location, Food_Type, Meal_Type)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?);"""
+                run_commit(q, (name, int(qty), expiry.strftime("%Y-%m-%d"), int(provider_id), provider_type, location, food_type, meal_type))
+                st.success("Listing added.")
 
-    # --- 9. Provider with Most Successful Claims (Metric) ---
-    st.write("#### 9. Provider with Most Successful Claims")
-    provider_with_most_successful_claims = run_query("""
-        SELECT p.Name, COUNT(c.Claim_ID) AS Successful_Claims
-        FROM Claims c
-        JOIN Food_Listings f ON c.Food_ID = f.Food_ID
-        JOIN Providers p ON f.Provider_ID = p.Provider_ID
-        WHERE c.Status = 'Completed'
-        GROUP BY p.Name
-        ORDER BY Successful_Claims DESC
-        LIMIT 1;
-    """)
-    if not provider_with_most_successful_claims.empty:
-        st.metric("Top Provider by Successful Claims", f" {provider_with_most_successful_claims.iloc[0]['Name']}")
-    else:
-        st.info("No data available.")
+    # Edit existing
+    st.write("---")
+    df = run_query("SELECT Food_ID, Food_Name FROM Food_Listings ORDER BY Food_ID DESC;")
+    if not df.empty:
+        chosen = st.selectbox("Choose listing to edit", df['Food_ID'].astype(str).tolist())
+        if chosen:
+            rec = run_query("SELECT * FROM Food_Listings WHERE Food_ID = ?", (int(chosen),)).iloc[0]
+            with st.form("edit_food"):
+                name = st.text_input("Food Name", value=rec['Food_Name'])
+                qty = st.number_input("Quantity", min_value=0, value=int(rec['Quantity']))
+                expiry = st.date_input("Expiry Date", value=pd.to_datetime(rec['Expiry_Date']).date() if rec['Expiry_Date'] else None)
+                provider_id = st.text_input("Provider_ID", value=str(rec['Provider_ID']))
+                provider_type = st.text_input("Provider Type", value=rec.get('Provider_Type', ''))
+                location = st.text_input("Location", value=rec.get('Location', ''))
+                food_type = st.text_input("Food Type", value=rec.get('Food_Type', ''))
+                meal_type = st.text_input("Meal Type", value=rec.get('Meal_Type', ''))
+                submit_edit = st.form_submit_button("Save changes")
+                if submit_edit:
+                    upd_q = """UPDATE Food_Listings SET Food_Name=?, Quantity=?, Expiry_Date=?,
+                               Provider_ID=?, Provider_Type=?, Location=?, Food_Type=?, Meal_Type=?
+                               WHERE Food_ID=?;"""
+                    run_commit(upd_q, (name, int(qty), expiry.strftime("%Y-%m-%d"), int(provider_id),
+                                       provider_type, location, food_type, meal_type, int(chosen)))
+                    st.success("Listing updated.")
 
-    st.markdown("---")
+    # Delete
+    st.write("---")
+    del_id = st.number_input("Enter Food_ID to delete", min_value=0, value=0)
+    if st.button("Delete listing"):
+        if del_id > 0:
+            run_commit("DELETE FROM Food_Listings WHERE Food_ID = ?", (int(del_id),))
+            st.success(f"Deleted listing {del_id}.")
 
-    # --- 10. Claims Status Percentages (Donut Chart) ---
-    st.write("#### 10. Claims Status Percentages")
-    claims_status_percentages = run_query("""
-        SELECT Status, 
-                ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM Claims), 2) AS Percentage
-        FROM Claims
-        GROUP BY Status;
-    """)
-    if not claims_status_percentages.empty:
-        fig = px.pie(
-            claims_status_percentages, names='Status', values='Percentage',
-            title='Claims Status Distribution', hole=0.3
-        )
-        # Update font size for the pie chart's text labels
-        fig.update_traces(textposition='inside', textinfo='percent+label', marker=dict(line=dict(color='#000000', width=1)))
-        fig.update_layout(uniformtext_minsize=14, uniformtext_mode='hide')
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No claims status data available.")
-        
-    st.markdown("---")
+def provider_portal():
+    st.header("Provider Portal — manage your listings")
+    provider_id = st.text_input("Provider ID")
+    contact = st.text_input("Provider Contact (for verification)")
 
-    # --- 11. Average Quantity Per Receiver (Bar Chart) ---
-    st.write("#### 11. Average Quantity Per Receiver")
-    avg_quantity_per_receiver = run_query("""
-        SELECT r.Name, ROUND(AVG(f.Quantity), 2) AS Avg_Quantity
-        FROM Claims c
-        JOIN Receivers r ON c.Receiver_ID = r.Receiver_ID
-        JOIN Food_Listings f ON c.Food_ID = f.Food_ID
-        GROUP BY r.Name;
-    """)
-    if not avg_quantity_per_receiver.empty:
-        fig = px.bar(
-            avg_quantity_per_receiver, x='Name', y='Avg_Quantity',
-            title='Average Quantity per Receiver', text='Avg_Quantity'
-        )
-        # Update font size for x-axis labels
-        fig.update_layout(xaxis_title_font=dict(size=18), xaxis_tickfont=dict(size=14))
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No data available.")
-        
-    st.markdown("---")
+    if st.button("Login as Provider"):
+        df = run_query("SELECT * FROM Providers WHERE Provider_ID = ? AND Contact = ?", (provider_id, contact))
+        if df.empty:
+            st.error("Invalid Provider ID or contact.")
+            return
+        st.success(f"Logged in as {df.iloc[0]['Name']}")
+        st.session_state['provider_id'] = int(provider_id)
 
-    # --- 12. Most Claimed Meal Type (Metric) ---
-    st.write("#### 12. Most Claimed Meal Type")
-    most_claimed_meal_type = run_query("""
-        SELECT Meal_Type, COUNT(*) AS Claims
-        FROM Claims c
-        JOIN Food_Listings f ON c.Food_ID = f.Food_ID
-        GROUP BY Meal_Type
-        ORDER BY Claims DESC
-        LIMIT 1;
-    """)
-    if not most_claimed_meal_type.empty:
-        st.metric("Most Claimed Meal Type", f" {most_claimed_meal_type.iloc[0]['Meal_Type']}")
-    else:
-        st.info("No data available.")
-        
-    st.markdown("---")
+    if st.session_state.get('provider_id'):
+        pid = st.session_state['provider_id']
+        st.subheader("Your Listings")
+        my_listings = run_query("SELECT * FROM Food_Listings WHERE Provider_ID = ?", (pid,))
+        st.dataframe(my_listings)
+        if not my_listings.empty:
+            sel = st.selectbox("Select your Food_ID to edit/delete", my_listings['Food_ID'].astype(str).tolist())
+            rec = my_listings[my_listings['Food_ID'] == int(sel)].iloc[0]
+            with st.form("provider_edit"):
+                name = st.text_input("Food Name", value=rec['Food_Name'])
+                qty = st.number_input("Quantity", value=int(rec['Quantity']), min_value=0)
+                expiry = st.date_input("Expiry Date", value=pd.to_datetime(rec['Expiry_Date']).date() if rec['Expiry_Date'] else None)
+                submit = st.form_submit_button("Save")
+                if submit:
+                    run_commit("""UPDATE Food_Listings SET Food_Name=?, Quantity=?, Expiry_Date=? WHERE Food_ID=?""",
+                               (name, int(qty), expiry.strftime("%Y-%m-%d"), int(sel)))
+                    st.success("Updated listing.")
+            if st.button("Delete selected listing"):
+                run_commit("DELETE FROM Food_Listings WHERE Food_ID = ?", (int(sel),))
+                st.success("Listing deleted.")
 
-    # --- 13. Total Donated by Provider (Bar Chart) ---
-    st.write("#### 13. Total Donated by Provider")
-    total_donated_by_provider = run_query("""
-        SELECT p.Name, SUM(f.Quantity) AS Total_Donated
-        FROM Food_Listings f
-        JOIN Providers p ON f.Provider_ID = p.Provider_ID
-        GROUP BY p.Name;
-    """)
-    if not total_donated_by_provider.empty:
-        fig = px.bar(
-            total_donated_by_provider, x='Name', y='Total_Donated',
-            title='Total Donated by Provider', text='Total_Donated'
-        )
-        # Update font size for x-axis labels
-        fig.update_layout(xaxis_title_font=dict(size=18), xaxis_tickfont=dict(size=14))
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No data available.")
-        
-    st.markdown("---")
+# ---------------- Admin Providers ----------------
+def admin_providers():
+    st.header("Providers — Add / Edit / Delete")
+    with st.expander("Add new provider"):
+        with st.form("add_provider"):
+            name = st.text_input("Provider Name")
+            ptype = st.text_input("Type")
+            address = st.text_area("Address")
+            city = st.text_input("City")
+            contact = st.text_input("Contact")
+            submit_add = st.form_submit_button("Add Provider")
+            if submit_add:
+                q = """INSERT INTO Providers (Name, Type, Address, City, Contact) VALUES (?, ?, ?, ?, ?);"""
+                run_commit(q, (name, ptype, address, city, contact))
+                st.success("Provider added.")
 
-    # --- 14. Top City by Completed Claims (Metric) ---
-    st.write("#### 14. Top City by Completed Claims")
-    top_city_by_completed_claims = run_query("""
-        SELECT f.Location, COUNT(*) AS Completed_Claims
-        FROM Claims c
-        JOIN Food_Listings f ON c.Food_ID = f.Food_ID
-        WHERE c.Status = 'Completed'
-        GROUP BY f.Location
-        ORDER BY Completed_Claims DESC
-        LIMIT 1;
-    """)
-    if not top_city_by_completed_claims.empty:
-        st.metric("City with the Most Completed Claims", f" {top_city_by_completed_claims.iloc[0]['Location']}")
-    else:
-        st.info("No data available.")
-        
-    st.markdown("---")
+    st.write("---")
+    df = run_query("SELECT Provider_ID, Name FROM Providers ORDER BY Provider_ID DESC;")
+    if not df.empty:
+        chosen = st.selectbox("Choose provider to edit", df['Provider_ID'].astype(str).tolist())
+        if chosen:
+            rec = run_query("SELECT * FROM Providers WHERE Provider_ID = ?", (int(chosen),)).iloc[0]
+            with st.form("edit_provider"):
+                name = st.text_input("Provider Name", value=rec['Name'])
+                ptype = st.text_input("Type", value=rec['Type'])
+                address = st.text_area("Address", value=rec['Address'])
+                city = st.text_input("City", value=rec['City'])
+                contact = st.text_input("Contact", value=rec['Contact'])
+                submit_edit = st.form_submit_button("Save changes")
+                if submit_edit:
+                    upd_q = """UPDATE Providers SET Name=?, Type=?, Address=?, City=?, Contact=? WHERE Provider_ID=?;"""
+                    run_commit(upd_q, (name, ptype, address, city, contact, int(chosen)))
+                    st.success("Provider updated.")
 
-    # --- 15. Expired Food Items (DataFrame) ---
-    st.write("#### 15. Expired Food Items")
-    expired_food_items = run_query("""
-        SELECT Food_Name, Expiry_Date
-        FROM Food_Listings
-        WHERE DATE(Expiry_Date) < DATE('now');
-    """)
-    if not expired_food_items.empty:
-        st.dataframe(expired_food_items, use_container_width=True)
-    else:
-        st.success("No food items have expired! Great job!")
+    st.write("---")
+    del_id = st.number_input("Enter Provider_ID to delete", min_value=0, value=0)
+    if st.button("Delete provider"):
+        if del_id > 0:
+            run_commit("DELETE FROM Providers WHERE Provider_ID = ?", (int(del_id),))
+            st.success(f"Deleted provider {del_id}.")
 
-elif choice == "Claims":
-    st.subheader("Food Claims Overview")
-    claims_data = run_query("""
-        SELECT c.Claim_ID, f.Food_Name, r.Name as Receiver, c.Status, c.Timestamp
-        FROM Claims c
-        JOIN Food_Listings f ON c.Food_ID = f.Food_ID
-        JOIN Receivers r ON c.Receiver_ID = r.Receiver_ID
-    """)
-    if not claims_data.empty:
-        st.dataframe(claims_data, use_container_width=True)
-    else:
-        st.info("No claims data available.")
+# ---------------- Admin Receivers ----------------
+def admin_receivers():
+    st.header("Receivers — Add / Edit / Delete")
+    with st.expander("Add new receiver"):
+        with st.form("add_receiver"):
+            name = st.text_input("Receiver Name")
+            rtype = st.text_input("Type")
+            city = st.text_input("City")
+            contact = st.text_input("Contact")
+            submit_add = st.form_submit_button("Add Receiver")
+            if submit_add:
+                q = """INSERT INTO Receivers (Name, Type, City, Contact) VALUES (?, ?, ?, ?);"""
+                run_commit(q, (name, rtype, city, contact))
+                st.success("Receiver added.")
 
-elif choice == "Food Listings":
-    st.subheader("Available Food Listings")
-    listings = run_query("SELECT * FROM Food_Listings")
-    if not listings.empty:
-        city = st.selectbox("Filter by City", ["All"] + list(listings["Location"].unique()))
-        if city != "All":
-            filtered_listings = listings[listings["Location"] == city]
-            st.dataframe(filtered_listings, use_container_width=True)
-        else:
-            st.dataframe(listings, use_container_width=True)
-    else:
-        st.info("No food listings available.")
+    st.write("---")
+    df = run_query("SELECT Receiver_ID, Name FROM Receivers ORDER BY Receiver_ID DESC;")
+    if not df.empty:
+        chosen = st.selectbox("Choose receiver to edit", df['Receiver_ID'].astype(str).tolist())
+        if chosen:
+            rec = run_query("SELECT * FROM Receivers WHERE Receiver_ID = ?", (int(chosen),)).iloc[0]
+            with st.form("edit_receiver"):
+                name = st.text_input("Receiver Name", value=rec['Name'])
+                rtype = st.text_input("Type", value=rec['Type'])
+                city = st.text_input("City", value=rec['City'])
+                contact = st.text_input("Contact", value=rec['Contact'])
+                submit_edit = st.form_submit_button("Save changes")
+                if submit_edit:
+                    upd_q = """UPDATE Receivers SET Name=?, Type=?, City=?, Contact=? WHERE Receiver_ID=?;"""
+                    run_commit(upd_q, (name, rtype, city, contact, int(chosen)))
+                    st.success("Receiver updated.")
 
-elif choice == "CRUD Operations":
-    st.subheader("Manage Food Listings")
-    
-    # --- Add New Food Listing Form ---
-    st.write("### Add New Food Listing")
-    with st.form("Add Food"):
-        food_id = st.number_input("Food ID", min_value=1, format="%d", help="The unique ID for the new food item.")
-        food_name = st.text_input("Food Name", help="The name of the food item.")
-        qty = st.number_input("Quantity", min_value=1, help="The quantity of the food item.")
-        expiry = st.date_input("Expiry Date", help="The expiration date of the food item.")
-        provider_id = st.number_input("Provider ID", min_value=1, help="The ID of the provider.")
-        location = st.text_input("Location", help="The city where the food is located.")
-        food_type = st.selectbox("Food Type", ["Vegetarian", "Non-Vegetarian", "Vegan"], help="The dietary type of the food.")
-        meal_type = st.selectbox("Meal Type", ["Breakfast", "Lunch", "Dinner", "Snacks"], help="The meal the food is intended for.")
-        submitted = st.form_submit_button("Add Listing")
-        
-        if submitted:
-            if food_id and food_name and qty and expiry and provider_id and location and food_type and meal_type:
-                try:
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        INSERT INTO Food_Listings (Food_ID, Food_Name, Quantity, Expiry_Date, Provider_ID, Location, Food_Type, Meal_Type)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (food_id, food_name, qty, str(expiry), provider_id, location, food_type, meal_type))
-                    conn.commit()
-                    st.success(f"Food listing with ID {food_id} added successfully!")
-                    st.experimental_rerun()
-                except sqlite3.Error as e:
-                    st.error(f"An error occurred while adding the listing: {e}")
-            else:
-                st.warning("Please fill in all the fields.")
+    st.write("---")
+    del_id = st.number_input("Enter Receiver_ID to delete", min_value=0, value=0)
+    if st.button("Delete receiver"):
+        if del_id > 0:
+            run_commit("DELETE FROM Receivers WHERE Receiver_ID = ?", (int(del_id),))
+            st.success(f"Deleted receiver {del_id}.")
 
-    st.markdown("---")
+# ---------------- Analytics ----------------
+ANALYTICS_QUERIES = {
+    "Provider count per city": "SELECT City, COUNT(*) AS provider_count FROM Providers GROUP BY City ORDER BY provider_count DESC;",
+    "Receiver count per city": "SELECT City, COUNT(*) AS receiver_count FROM Receivers GROUP BY City;",
+    "Most contributing provider type": """SELECT p.Type AS provider_type, SUM(f.Quantity) AS total_qty
+                                         FROM Providers p JOIN Food_Listings f ON p.Provider_ID=f.Provider_ID
+                                         GROUP BY p.Type ORDER BY total_qty DESC LIMIT 10;""",
+    "Total available food quantity": "SELECT SUM(Quantity) AS total_available FROM Food_Listings;",
+    "City with most listings": "SELECT Location AS city, COUNT(*) AS listings FROM Food_Listings GROUP BY Location ORDER BY listings DESC LIMIT 10;",
+    "Most common food types": "SELECT Food_Type, COUNT(*) AS freq FROM Food_Listings GROUP BY Food_Type ORDER BY freq DESC LIMIT 10;",
+    "Claims per food item": "SELECT f.Food_ID, f.Food_Name, COUNT(c.Claim_ID) AS claim_count FROM Food_Listings f LEFT JOIN Claims c ON f.Food_ID=c.Food_ID GROUP BY f.Food_ID ORDER BY claim_count DESC LIMIT 20;",
+    "Provider with most completed claims": "SELECT p.Provider_ID, p.Name, COUNT(c.Claim_ID) AS completed_claims FROM Providers p JOIN Food_Listings f ON p.Provider_ID=f.Provider_ID JOIN Claims c ON f.Food_ID=c.Food_ID WHERE c.Status='Completed' GROUP BY p.Provider_ID ORDER BY completed_claims DESC LIMIT 10;",
+    "Claim status percent": "SELECT Status, COUNT(*)*100.0/(SELECT COUNT(*) FROM Claims) AS percent FROM Claims GROUP BY Status;",
+    "Avg quantity claimed per receiver": "SELECT c.Receiver_ID, r.Name, AVG(f.Quantity) AS avg_quantity FROM Claims c JOIN Food_Listings f ON c.Food_ID=f.Food_ID JOIN Receivers r ON c.Receiver_ID=r.Receiver_ID GROUP BY c.Receiver_ID ORDER BY avg_quantity DESC LIMIT 20;",
+    "Most claimed meal type": "SELECT f.Meal_Type, COUNT(c.Claim_ID) AS times_claimed FROM Food_Listings f JOIN Claims c ON f.Food_ID=c.Food_ID GROUP BY f.Meal_Type ORDER BY times_claimed DESC;",
+    "Total quantity donated by provider": "SELECT p.Provider_ID, p.Name, SUM(f.Quantity) AS total_donated FROM Providers p JOIN Food_Listings f ON p.Provider_ID=f.Provider_ID GROUP BY p.Provider_ID ORDER BY total_donated DESC LIMIT 20;",
+    "Listings near expiry (next 2 days)": "SELECT * FROM Food_Listings WHERE Expiry_Date BETWEEN date('now') AND date('now','+2 day') ORDER BY Expiry_Date ASC;",
+    "Top locations by quantity": "SELECT Location, SUM(Quantity) AS total_qty FROM Food_Listings GROUP BY Location ORDER BY total_qty DESC LIMIT 10;",
+    "Receivers with most claims": "SELECT r.Receiver_ID, r.Name, COUNT(c.Claim_ID) AS num_claims FROM Receivers r JOIN Claims c ON r.Receiver_ID=c.Receiver_ID GROUP BY r.Receiver_ID ORDER BY num_claims DESC LIMIT 20;"
+}
 
-    # --- Delete Food Listing Form ---
-    st.write("### Delete a Food Listing")
-    with st.form("Delete Food"):
-        food_id = st.number_input("Food ID to Delete", min_value=1, format="%d", help="Enter the ID of the food item to delete.")
-        delete_button = st.form_submit_button("Delete Listing")
+def analytics_page():
+    st.header("Analytics")
+    for title, q in ANALYTICS_QUERIES.items():
+        with st.expander(title):
+            df = run_query(q)
+            st.write(df)
+            if not df.empty and df.shape[1] >= 2:
+                col2 = df.columns[1]
+                if pd.api.types.is_numeric_dtype(df[col2]):
+                    try:
+                        chart_df = df.set_index(df.columns[0])[col2]
+                        st.bar_chart(chart_df)
+                    except Exception:
+                        pass
 
-        if delete_button:
-            if conn:
-                try:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT COUNT(*) FROM Food_Listings WHERE Food_ID = ?", (food_id,))
-                    exists = cursor.fetchone()[0] > 0
-                    
-                    if exists:
-                        conn.execute("DELETE FROM Food_Listings WHERE Food_ID = ?", (food_id,))
-                        conn.commit()
-                        st.success(f"Food listing with ID {food_id} has been successfully deleted.")
-                        st.experimental_rerun()
-                    else:
-                        st.warning(f"No food listing found with ID {food_id}.")
-                except sqlite3.Error as e:
-                    st.error(f"An error occurred while deleting the listing: {e}")
+
+
+
+
+
+
+
+
+# ---------------- Main App ----------------
+st.set_page_config(page_title="Local Food Wastage System", layout="wide")
+st.title("Food Wastage Management System")
+
+PAGES = {
+    "Home": lambda: st.subheader("Welcome to Local Food Wastage System\nUse the sidebar to navigate\ncreated by Syed Qavi Uddin"),
+    "Browse Listings": browse_listings,
+    "Provider Portal": provider_portal,
+    "Receiver Portal": admin_receivers,
+    "Admin - Providers": admin_providers,
+    "Admin - Listings": admin_food_listings,
+    "Analytics": analytics_page,
+  
+}
+
+choice = st.sidebar.selectbox("Menu", list(PAGES.keys()))
+PAGES[choice]()
+
